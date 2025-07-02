@@ -17,7 +17,6 @@ def load_data(uploaded_file):
             engine="openpyxl",
             parse_dates=["Date"]
         )
-    # normalizar nome de colunas (só por precaução)
     df.columns = df.columns.str.strip()
     return df
 
@@ -41,8 +40,6 @@ def prepare_availability(df):
     residentes = list(df["Name"].unique())
     slots = df.index.tolist()
     availability = {}
-    # exemplo de regra: todo residente está disponível, mas aqui
-    # você pode filtrar por Staff Type ou outras regras
     for r in residentes:
         for i in slots:
             availability[(r, i)] = True
@@ -77,7 +74,6 @@ def solve_model(df, residentes, slots, availability, objective):
     }
 
     # 2.4) Funções de custo / equilíbrio
-    # total_hours[r] = soma de horas alocadas a r
     total_hours = {}
     for r in residentes:
         terms = []
@@ -88,7 +84,6 @@ def solve_model(df, residentes, slots, availability, objective):
         model.Add(total_hours[r] == sum(terms))
 
     if objective == "fairness":
-        # minimize max(r) - min(r)
         z_max = model.NewIntVar(0, sum(hours.values()), "z_max")
         z_min = model.NewIntVar(0, sum(hours.values()), "z_min")
         for r in residentes:
@@ -97,11 +92,9 @@ def solve_model(df, residentes, slots, availability, objective):
         model.Minimize(z_max - z_min)
 
     elif objective == "min_hours":
-        # minimize soma total de horas
         model.Minimize(sum(total_hours[r] for r in residentes))
 
     elif objective == "elective_focus":
-        # maximize alocações em Elective → minimize -bonus
         term = []
         for (r, i), var in x.items():
             term.append(var * elective_bonus[(r, i)])
@@ -112,9 +105,8 @@ def solve_model(df, residentes, slots, availability, objective):
 
     # 2.5) Resolver com parâmetros para velocidade
     solver = cp_model.CpSolver()
-    solver.parameters.max_time_in_seconds = 20    # limite de tempo
+    solver.parameters.max_time_in_seconds = 20    # limite de tempo em segundos
     solver.parameters.num_search_workers = 8      # threads paralelas
-    solver.parameters.maximize = False            # garante MIP
     status = solver.Solve(model)
 
     # 2.6) Extrair solução para DataFrame
@@ -124,10 +116,10 @@ def solve_model(df, residentes, slots, availability, objective):
             if solver.Value(var) == 1:
                 row = df.loc[i]
                 results.append({
-                    "Date":    row["Date"].date(),
+                    "Date":       row["Date"].date(),
                     "Assignment": row["Assignment"],
-                    "Resident":  r,
-                    "Hours":     row["Hours"],
+                    "Resident":   r,
+                    "Hours":      row["Hours"],
                     "Staff Type": row["Staff Type"]
                 })
     return pd.DataFrame(results)
@@ -161,7 +153,6 @@ def main():
     # disponibilidade esparsa
     residentes, slots, availability = prepare_availability(df)
 
-    # gerar cenários em cache separado
     if st.button("🔢 Gerar 3 Cenários"):
         with st.spinner("Resolvendo cenários..."):
             df1 = solve_model(df, residentes, slots, availability, "fairness")
