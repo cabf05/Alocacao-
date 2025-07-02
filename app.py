@@ -4,169 +4,115 @@ from datetime import datetime
 from ortools.sat.python import cp_model
 
 # ----------------------------
-# 1) Funções de carregamento e pré-processamento com cache
+# Utilitários com cache
 # ----------------------------
-@st.cache_data(show_spinner=False)
+@st.cache_data
 def load_data(uploaded_file):
-    """Lê CSV ou Excel e retorna DataFrame com coluna Date em datetime."""
     if uploaded_file.name.endswith(".csv"):
         df = pd.read_csv(uploaded_file, parse_dates=["Date"])
     else:
-        df = pd.read_excel(
-            uploaded_file,
-            engine="openpyxl",
-            parse_dates=["Date"]
-        )
+        df = pd.read_excel(uploaded_file, engine="openpyxl", parse_dates=["Date"])
     df.columns = df.columns.str.strip()
     return df
 
-@st.cache_data(show_spinner=False)
-def filter_date_range(df, start_date, end_date):
-    """Aplica filtro de data."""
-    if start_date:
-        df = df[df.Date >= pd.to_datetime(start_date)]
-    if end_date:
-        df = df[df.Date <= pd.to_datetime(end_date)]
-    return df.reset_index(drop=True)
+@st.cache_data
+def pick_slots(df):
+    """Retorna índices de slots de JC/MKSAP (segunda) e MR (sexta) conforme regras."""
+    df = df.copy()
+    df["Date"] = pd.to_datetime(df["Date"])
+    # Journal Club: segundas entre set/jun, toda 2ª semana
+    start_jc = datetime(df.Date.dt.year.min(), 9, 1)
+    end_jc   = datetime(df.Date.dt.year.min()+1, 6, 30)
+    mondays = df[(df.Date.dt.weekday == 0) &
+                 (df.Date >= start_jc) & (df.Date <= end_jc)].sort_values("Date")
+    # pegar alternadas, máximo 9
+    jc_idxs = mondays.iloc[::2].index.tolist()[:9]
 
-@st.cache_data(show_spinner=False)
-def prepare_availability(df):
-    """
-    Cria:
-      - lista de residentes,
-      - lista de índices de slots,
-      - dicionário availability só com pares (residente,slot) disponíveis.
-    """
-    residentes = list(df["Name"].unique())
-    slots = df.index.tolist()
-    availability = {}
-    for r in residentes:
-        for i in slots:
-            availability[(r, i)] = True
-    return residentes, slots, availability
+    # Cardiology Report: sextas a partir de 15/08 até 30/06, toda 2ª semana
+    start_mr = datetime(df.Date.dt.year.min(), 8, 15)
+    end_mr   = end_jc
+    fridays = df[(df.Date.dt.weekday == 4) &
+                 (df.Date >= start_mr) & (df.Date <= end_mr)].sort_values("Date")
+    mr_idxs = fridays.iloc[::2].index.tolist()[:18]
+
+    return jc_idxs, mr_idxs
 
 # ----------------------------
-# 2) Modelo CP-SAT esparso
+# Montagem e solução ILP (Pulp)
 # ----------------------------
-def solve_model(df, residentes, slots, availability, objective):
-    """
-    Monta e resolve o modelo CP-SAT com variáveis esparsas.
-    objective: "fairness", "min_hours", ou "elective_focus"
-    """
-    model = cp_model.CpModel()
+def solve_schedule(df, jc_idxs, mr_idxs):
+    import pulp
+    R = df["Name"].unique().tolist()
+    S = jc_idxs + mr_idxs
 
-    # 2.1) Variáveis binárias apenas onde availability == True
-    x = {}
-    for (r, i), avail in availability.items():
-        if avail:
-            x[(r, i)] = model.NewBoolVar(f"x_{r}_{i}")
+    # disponibilidade simples: r disponível em todos os S (ajuste se quiser)
+    avail = {(r, s): True for r in R for s in S}
 
-    # 2.2) Cada slot é coberto exatamente uma vez
-    for i in slots:
-        vars_slot = [x[(r, i)] for r in residentes if (r, i) in x]
-        model.Add(sum(vars_slot) == 1)
+    # modelo
+    model = pulp.LpProblem("Schedule", pulp.LpMinimize)
+    x = pulp.LpVariable.dicts("x", (R, S), cat="Binary")
 
-    # 2.3) Precomputar horas e bônus por (r,i)
-    hours = { (r, i): int(df.at[i, "Hours"]) for (r, i) in x }
-    elective_bonus = {
-        (r, i): 1 if "Elective" in str(df.at[i, "Staff Type"]) else 0
-        for (r, i) in x
-    }
+    # cada slot = 1 residente
+    for s in S:
+        model += pulp.lpSum(x[r][s] for r in R) == 1
 
-    # 2.4) Funções de custo / equilíbrio
-    total_hours = {}
-    for r in residentes:
-        terms = []
-        for i in slots:
-            if (r, i) in x:
-                terms.append(x[(r, i)] * hours[(r, i)])
-        total_hours[r] = model.NewIntVar(0, sum(hours.values()), f"hrs_{r}")
-        model.Add(total_hours[r] == sum(terms))
+    # só se disponível
+    for r in R:
+        for s in S:
+            model += x[r][s] <= avail[r, s]
 
-    if objective == "fairness":
-        z_max = model.NewIntVar(0, sum(hours.values()), "z_max")
-        z_min = model.NewIntVar(0, sum(hours.values()), "z_min")
-        for r in residentes:
-            model.Add(total_hours[r] <= z_max)
-            model.Add(total_hours[r] >= z_min)
-        model.Minimize(z_max - z_min)
+    # horas totais
+    hours = {r: pulp.lpSum(x[r][s] * df.at[s, "Hours"] for s in S) for r in R}
 
-    elif objective == "min_hours":
-        model.Minimize(sum(total_hours[r] for r in residentes))
+    # força 3 com ambos JC e MR
+    y = pulp.LpVariable.dicts("y", R, cat="Binary")
+    for r in R:
+        model += y[r] <= pulp.lpSum(x[r][s] for s in jc_idxs)
+        model += y[r] <= pulp.lpSum(x[r][s] for s in mr_idxs)
+        model += y[r] >= pulp.lpSum(x[r][s] for s in jc_idxs) + \
+                        pulp.lpSum(x[r][s] for s in mr_idxs) - 1
+    model += pulp.lpSum(y[r] for r in R) == 3
 
-    elif objective == "elective_focus":
-        term = []
-        for (r, i), var in x.items():
-            term.append(var * elective_bonus[(r, i)])
-        model.Minimize(-sum(term))
+    # objetivo: minimizar diferença de carga
+    z_max = pulp.LpVariable("z_max", lowBound=0)
+    z_min = pulp.LpVariable("z_min", lowBound=0)
+    for r in R:
+        model += hours[r] <= z_max
+        model += hours[r] >= z_min
+    model += z_max - z_min
 
-    else:
-        raise ValueError(f"Objective '{objective}' não reconhecido")
+    # resolve
+    model.solve(pulp.PULP_CBC_CMD(msg=False))
 
-    # 2.5) Resolver com parâmetros para velocidade
-    solver = cp_model.CpSolver()
-    solver.parameters.max_time_in_seconds = 20    # limite de tempo em segundos
-    solver.parameters.num_search_workers = 8      # threads paralelas
-    status = solver.Solve(model)
-
-    # 2.6) Extrair solução para DataFrame
-    results = []
-    if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-        for (r, i), var in x.items():
-            if solver.Value(var) == 1:
-                row = df.loc[i]
-                results.append({
+    # extrai
+    out = []
+    for s in S:
+        for r in R:
+            if x[r][s].value() == 1:
+                row = df.loc[s]
+                out.append({
                     "Date":       row["Date"].date(),
                     "Assignment": row["Assignment"],
                     "Resident":   r,
-                    "Hours":      row["Hours"],
-                    "Staff Type": row["Staff Type"]
+                    "JC?" :       s in jc_idxs,
+                    "MR?":        s in mr_idxs,
+                    "Hours":      row["Hours"]
                 })
-    return pd.DataFrame(results)
+    return pd.DataFrame(out).sort_values("Date")
 
 # ----------------------------
-# 3) Streamlit App
+# App Streamlit
 # ----------------------------
-def main():
-    st.title("🔄 Sugestões Ágeis de Alocação de Residentes")
+st.title("📅 Alocação Focada: JC & Cardiology Reports")
 
-    uploaded = st.file_uploader("Faça upload (.csv / .xlsx)", type=["csv","xlsx"])
-    if not uploaded:
-        st.info("Aguardando upload da planilha...")
-        return
-
+uploaded = st.file_uploader("Upload (.csv / .xlsx)", type=["csv","xlsx"])
+if uploaded:
     df = load_data(uploaded)
-
-    # filtro de datas
-    min_date = df.Date.min().date()
-    max_date = df.Date.max().date()
-    start_date, end_date = st.date_input(
-        "Período de interesse",
-        [min_date, max_date],
-        min_value=min_date,
-        max_value=max_date
-    )
-    df = filter_date_range(df, start_date, end_date)
-    st.subheader("📋 Dados Filtrados")
-    st.dataframe(df)
-
-    # disponibilidade esparsa
-    residentes, slots, availability = prepare_availability(df)
-
-    if st.button("🔢 Gerar 3 Cenários"):
-        with st.spinner("Resolvendo cenários..."):
-            df1 = solve_model(df, residentes, slots, availability, "fairness")
-            df2 = solve_model(df, residentes, slots, availability, "min_hours")
-            df3 = solve_model(df, residentes, slots, availability, "elective_focus")
-
-        st.subheader("Cenário 1 – Minimizar Diferença de Carga (Fairness)")
-        st.dataframe(df1)
-
-        st.subheader("Cenário 2 – Minimizar Soma Total de Horas")
-        st.dataframe(df2)
-
-        st.subheader("Cenário 3 – Priorizar 'Elective'")
-        st.dataframe(df3)
-
-if __name__ == "__main__":
-    main()
+    jc_idxs, mr_idxs = pick_slots(df)
+    if st.button("Gerar Melhor Agenda"):
+        with st.spinner("Calculando..."):
+            schedule = solve_schedule(df, jc_idxs, mr_idxs)
+        st.subheader("Agenda Ótima")
+        st.dataframe(schedule)
+        st.markdown(f"- **Total de slots:** {len(jc_idxs)} JC + {len(mr_idxs)} MR = {len(jc_idxs)+len(mr_idxs)}")
+        st.markdown("- 3 residentes apresentarão ambos JC e MR.")
